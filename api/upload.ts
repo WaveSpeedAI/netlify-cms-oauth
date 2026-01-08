@@ -1,53 +1,48 @@
-import { IncomingMessage, ServerResponse } from "http";
-import https from "https";
+import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 const GITHUB_ORG = "WaveSpeedAI";
 
-export default async (req: IncomingMessage, res: ServerResponse) => {
-  // Set CORS headers
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // Set CORS headers on every response
+  Object.entries(corsHeaders).forEach(([key, value]) => {
+    res.setHeader(key, value);
+  });
 
   if (req.method === "OPTIONS") {
-    res.statusCode = 200;
-    res.end();
-    return;
+    return res.status(200).end();
   }
 
   if (req.method !== "POST") {
-    res.statusCode = 405;
-    res.end(JSON.stringify({ error: "Method not allowed" }));
-    return;
-  }
-
-  // Check for GitHub token in Authorization header
-  const authHeader = req.headers["authorization"];
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    res.statusCode = 401;
-    res.end(JSON.stringify({ error: "Missing authorization token" }));
-    return;
-  }
-
-  const githubToken = authHeader.replace("Bearer ", "");
-
-  // Verify user is a member of the WaveSpeedAI org
-  const isMember = await checkOrgMembership(githubToken);
-  if (!isMember) {
-    res.statusCode = 403;
-    res.end(JSON.stringify({ error: "You must be a member of the WaveSpeedAI organization" }));
-    return;
-  }
-
-  const apiKey = process.env.WAVESPEED_UPLOAD_API_KEY;
-  if (!apiKey) {
-    res.statusCode = 500;
-    res.end(JSON.stringify({ error: "Missing upload API key" }));
-    return;
+    return res.status(405).json({ error: "Method not allowed" });
   }
 
   try {
-    // Collect incoming request body
+    // Check for GitHub token in Authorization header
+    const authHeader = req.headers["authorization"];
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "Missing authorization token" });
+    }
+
+    const githubToken = authHeader.replace("Bearer ", "");
+
+    // Verify user is a member of the WaveSpeedAI org
+    const isMember = await checkOrgMembership(githubToken);
+    if (!isMember) {
+      return res.status(403).json({ error: "You must be a member of the WaveSpeedAI organization" });
+    }
+
+    const apiKey = process.env.WAVESPEED_UPLOAD_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: "Missing upload API key" });
+    }
+
+    // Get the raw body as Buffer
     const chunks: Buffer[] = [];
     for await (const chunk of req) {
       chunks.push(chunk as Buffer);
@@ -57,124 +52,77 @@ export default async (req: IncomingMessage, res: ServerResponse) => {
     // Get content-type header (includes boundary for multipart)
     const contentType = req.headers["content-type"];
     if (!contentType) {
-      res.statusCode = 400;
-      res.end(JSON.stringify({ error: "Missing content-type" }));
-      return;
+      return res.status(400).json({ error: "Missing content-type" });
     }
 
     // Forward to WaveSpeed API
     const result = await uploadToWaveSpeed(body, contentType, apiKey);
-
-    res.setHeader("Content-Type", "application/json");
-    res.statusCode = 200;
-    res.end(JSON.stringify(result));
+    return res.status(200).json(result);
   } catch (e: any) {
     console.error("Upload error:", e.message);
-    res.statusCode = 500;
-    res.end(JSON.stringify({ error: e.message }));
+    return res.status(500).json({ error: e.message || "Upload failed" });
   }
-};
+}
 
 async function checkOrgMembership(token: string): Promise<boolean> {
-  // First get the authenticated user's username
   const username = await getUsername(token);
   if (!username) return false;
 
-  // Check if user is a member of the org
-  // https://docs.github.com/en/rest/orgs/members#check-organization-membership-for-a-user
-  return new Promise((resolve) => {
-    const req = https.request(
-      {
-        hostname: "api.github.com",
-        path: `/orgs/${GITHUB_ORG}/members/${username}`,
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "User-Agent": "WaveSpeed-CMS",
-          Accept: "application/vnd.github+json",
-        },
+  const response = await fetch(
+    `https://api.github.com/orgs/${GITHUB_ORG}/members/${username}`,
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "User-Agent": "WaveSpeed-CMS",
+        Accept: "application/vnd.github+json",
       },
-      (response) => {
-        // 204: User is a member
-        // 302: Requester is not an org member
-        // 404: User is not a member
-        resolve(response.statusCode === 204);
-      }
-    );
-    req.on("error", () => resolve(false));
-    req.end();
-  });
+    }
+  );
+
+  // 204: User is a member
+  // 302: Requester is not an org member
+  // 404: User is not a member
+  return response.status === 204;
 }
 
-function getUsername(token: string): Promise<string | null> {
-  return new Promise((resolve) => {
-    const req = https.request(
-      {
-        hostname: "api.github.com",
-        path: "/user",
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "User-Agent": "WaveSpeed-CMS",
-          Accept: "application/vnd.github+json",
-        },
+async function getUsername(token: string): Promise<string | null> {
+  try {
+    const response = await fetch("https://api.github.com/user", {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "User-Agent": "WaveSpeed-CMS",
+        Accept: "application/vnd.github+json",
       },
-      (response) => {
-        let data = "";
-        response.on("data", (chunk) => (data += chunk));
-        response.on("end", () => {
-          try {
-            const user = JSON.parse(data);
-            resolve(user.login || null);
-          } catch {
-            resolve(null);
-          }
-        });
-      }
-    );
-    req.on("error", () => resolve(null));
-    req.end();
-  });
+    });
+
+    if (!response.ok) return null;
+    const user = await response.json();
+    return user.login || null;
+  } catch {
+    return null;
+  }
 }
 
-function uploadToWaveSpeed(
+async function uploadToWaveSpeed(
   body: Buffer,
   contentType: string,
   apiKey: string
-): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const req = https.request(
-      {
-        hostname: "scheduler.wavespeed.ai",
-        path: "/api/v1/files/upload/binary",
-        method: "POST",
-        headers: {
-          "Content-Type": contentType,
-          "Content-Length": body.length,
-          Authorization: `Bearer ${apiKey}`,
-        },
+): Promise<{ url: string }> {
+  const response = await fetch(
+    "https://scheduler.wavespeed.ai/api/v1/files/upload/binary",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": contentType,
+        Authorization: `Bearer ${apiKey}`,
       },
-      (response) => {
-        let data = "";
-        response.on("data", (chunk) => {
-          data += chunk;
-        });
-        response.on("end", () => {
-          try {
-            const parsed = JSON.parse(data);
-            if (parsed.code === 200 && parsed.data?.full_path) {
-              resolve({ url: parsed.data.full_path });
-            } else {
-              reject(new Error(parsed.message || "Upload failed"));
-            }
-          } catch {
-            reject(new Error("Invalid response from upload API"));
-          }
-        });
-      }
-    );
-    req.on("error", reject);
-    req.write(body);
-    req.end();
-  });
+      body: body,
+    }
+  );
+
+  const data = await response.json();
+  if (data.code === 200 && data.data?.full_path) {
+    return { url: data.data.full_path };
+  }
+  throw new Error(data.message || "Upload failed");
 }
